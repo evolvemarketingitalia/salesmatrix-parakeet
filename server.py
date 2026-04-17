@@ -62,10 +62,20 @@ _total_transcription_s = 0.0
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Load model at startup (blocking — healthcheck start_period covers this)
-    logger.info("Loading model at startup...")
-    transcriber.load()
-    logger.info("Startup complete. Ready to accept connections.")
+    # Load model in a background thread so /health responds 200 immediately.
+    # Easypanel/k8s health probes can mark the container healthy during the
+    # ~20s cold start (model download + ONNX init).
+    import threading
+
+    def _load():
+        try:
+            transcriber.load()
+            logger.info("Startup complete. Ready to accept connections.")
+        except Exception:
+            logger.exception("Background model load failed")
+
+    logger.info("Starting background model loader...")
+    threading.Thread(target=_load, daemon=True, name="parakeet-model-loader").start()
     yield
     logger.info("Shutdown.")
 
@@ -97,17 +107,27 @@ def _check_token(token: Optional[str]) -> None:
 
 @app.get("/health")
 def health():
+    # Always 200 when the uvicorn process is alive.
+    # model_loaded=false during the first ~20s of cold start.
+    # Easypanel uses this for liveness; use /ready for readiness.
     ready = transcriber.is_ready()
-    status_code = 200 if ready else 503
     return JSONResponse(
         {
-            "status": "healthy" if ready else "loading",
+            "status": "ready" if ready else "starting",
             "model_loaded": ready,
             "model": "parakeet-tdt-0.6b-v3",
             "version": "0.1.0",
         },
-        status_code=status_code,
+        status_code=200,
     )
+
+
+@app.get("/ready")
+def ready():
+    """Readiness probe: 200 only when model is fully loaded and can serve traffic."""
+    if transcriber.is_ready():
+        return JSONResponse({"ready": True}, status_code=200)
+    return JSONResponse({"ready": False}, status_code=503)
 
 
 @app.get("/metrics")
