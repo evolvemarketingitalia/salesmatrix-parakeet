@@ -252,55 +252,64 @@ async def ws_transcribe(ws: WebSocket, token: Optional[str] = Query(None)):
     stop_flag = asyncio.Event()
 
     async def flusher():
-        while not stop_flag.is_set():
-            try:
-                await asyncio.wait_for(stop_flag.wait(), timeout=0.2)
-                return
-            except asyncio.TimeoutError:
-                pass
+        # Re-declare globals for this closure scope — Python's `global` is
+        # per-function, NOT inherited by nested functions. Without this,
+        # `_total_transcription_s += ...` below raises UnboundLocalError
+        # on the FIRST assignment and kills the flusher silently.
+        global _total_transcription_s
 
-            if session.age_s > MAX_SESSION_MINUTES * 60:
-                await safe_send_json({"type": "info", "message": "session time limit reached"})
-                await ws.close(code=1000, reason="time limit")
-                stop_flag.set()
-                return
+        logger.info("flusher task started")
+        try:
+            while not stop_flag.is_set():
+                await asyncio.sleep(0.2)
+                if stop_flag.is_set():
+                    break
 
-            if session.buffer_ms >= MIN_CHUNK_MS:
-                chunk = session.take_chunk()
-                if len(chunk) < (SAMPLE_RATE // 10) * 2:  # < 100ms -> skip
-                    continue
-                try:
-                    result: TranscriptionResult = await loop.run_in_executor(
-                        None, transcriber.transcribe_pcm16, chunk
-                    )
-                except Exception as e:
-                    logger.exception("Chunk transcription failed")
-                    await safe_send_json({"type": "error", "code": "TRANSCRIBE_FAIL", "message": str(e)[:200]})
-                    continue
+                if session.age_s > MAX_SESSION_MINUTES * 60:
+                    await safe_send_json({"type": "info", "message": "session time limit reached"})
+                    await ws.close(code=1000, reason="time limit")
+                    break
 
-                text = result.text
-                if text:
-                    session.committed_text = (session.committed_text + " " + text).strip()
+                if session.buffer_ms >= MIN_CHUNK_MS:
+                    chunk = session.take_chunk()
+                    if len(chunk) < (SAMPLE_RATE // 10) * 2:  # < 100ms -> skip
+                        continue
+                    try:
+                        result: TranscriptionResult = await loop.run_in_executor(
+                            None, transcriber.transcribe_pcm16, chunk
+                        )
+                    except Exception as e:
+                        logger.exception("Chunk transcription failed")
+                        await safe_send_json({"type": "error", "code": "TRANSCRIBE_FAIL", "message": str(e)[:200]})
+                        continue
+
+                    text = result.text
+                    if text:
+                        session.committed_text = (session.committed_text + " " + text).strip()
+                        await safe_send_json({
+                            "type": "final",
+                            "text": text,
+                            "utterance_id": session.utterance_id,
+                            "committed_text": session.committed_text,
+                        })
+                        session.utterance_id += 1
+                        _total_transcription_s += result.duration_s
+
+                # Anti-degrade reset after long silence (no audio received for N seconds)
+                if session.should_reset():
+                    session.reset_count += 1
+                    session.buffer = bytearray()
                     await safe_send_json({
-                        "type": "final",
-                        "text": text,
-                        "utterance_id": session.utterance_id,
-                        "committed_text": session.committed_text,
+                        "type": "info",
+                        "message": "reset after silence",
+                        "reason": "anti_degrade",
+                        "reset_count": session.reset_count,
                     })
-                    session.utterance_id += 1
-                    _total_transcription_s += result.duration_s
-
-            # Anti-degrade reset after long silence (no audio received for N seconds)
-            if session.should_reset():
-                session.reset_count += 1
-                session.buffer = bytearray()
-                await safe_send_json({
-                    "type": "info",
-                    "message": "reset after silence",
-                    "reason": "anti_degrade",
-                    "reset_count": session.reset_count,
-                })
-                session.last_audio_at = time.time()
+                    session.last_audio_at = time.time()
+        except Exception:
+            logger.exception("flusher task crashed")
+        finally:
+            logger.info(f"flusher task exiting (stop_flag={stop_flag.is_set()}, utterances={session.utterance_id - 1})")
 
     flusher_task = asyncio.create_task(flusher())
 
