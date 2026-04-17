@@ -45,7 +45,7 @@ class ParakeetTranscriber:
         self._loading_error: Optional[str] = None
 
     def load(self) -> None:
-        """Load ONNX model from HuggingFace (cached locally)."""
+        """Load ONNX model from HuggingFace (cached locally) + warmup."""
         import onnx_asr
 
         logger.info(f"Loading Parakeet v3 ONNX model: {MODEL_NAME}")
@@ -54,6 +54,18 @@ class ParakeetTranscriber:
             self._model = onnx_asr.load_model(MODEL_NAME)
             elapsed = time.time() - start
             logger.info(f"Model loaded in {elapsed:.1f}s (sample_rate={SAMPLE_RATE})")
+
+            # Warmup: run a dummy inference to JIT-compile ONNX kernels.
+            # Without this, the FIRST real streaming chunk is 5-10x slower
+            # than subsequent ones, which causes the live transcription to
+            # fall behind and batch everything at session end.
+            logger.info("Warming up model...")
+            warmup_start = time.time()
+            dummy = np.zeros(SAMPLE_RATE * 2, dtype=np.float32)  # 2s of silence
+            with self._lock:
+                _ = self._model.recognize(dummy)
+            logger.info(f"Warmup done in {time.time()-warmup_start:.1f}s")
+
             self._loaded = True
         except Exception as e:
             logger.exception("Model load failed")
@@ -80,9 +92,10 @@ class ParakeetTranscriber:
             text = self._model.recognize(samples)
             elapsed = time.time() - start
 
-        logger.debug(
-            f"Transcribed {duration_s:.2f}s audio in {elapsed:.3f}s "
-            f"(rtf={elapsed/duration_s:.2f}x) -> {text[:80]!r}"
+        # INFO level for streaming chunks so we can spot latency regressions in prod
+        logger.info(
+            f"stream chunk: audio={duration_s:.2f}s, infer={elapsed:.3f}s, "
+            f"rtf={elapsed/duration_s:.2f}x, text={text[:60]!r}"
         )
         return TranscriptionResult(text=(text or "").strip(), duration_s=duration_s)
 
@@ -185,13 +198,28 @@ class StreamSession:
         self.buffer.extend(pcm_bytes)
         self.last_audio_at = time.time()
 
-    def take_chunk(self) -> bytes:
-        """Extract accumulated PCM and reset buffer (keeping overlap)."""
-        if self.overlap_bytes > 0 and len(self.buffer) > self.overlap_bytes:
+    def take_chunk(self, max_ms: int = MAX_CHUNK_MS) -> bytes:
+        """Extract accumulated PCM up to `max_ms` (reset buffer keeping overlap).
+
+        If the buffer is larger than max_ms we truncate: this prevents an
+        ever-growing buffer if inference is slower than ingest. The remaining
+        audio stays in the buffer and will be processed on the next tick.
+        """
+        max_bytes = (max_ms * SAMPLE_RATE * 2) // 1000
+        buf_len = len(self.buffer)
+
+        if buf_len > max_bytes:
+            chunk = bytes(self.buffer[:max_bytes])
+            # Keep everything beyond max_bytes, minus overlap at the start
+            start = max(0, max_bytes - self.overlap_bytes)
+            self.buffer = bytearray(self.buffer[start:])
+            return chunk
+
+        if self.overlap_bytes > 0 and buf_len > self.overlap_bytes:
             chunk = bytes(self.buffer)
-            # Keep last `overlap_bytes` for next iteration to smooth boundaries
             self.buffer = bytearray(self.buffer[-self.overlap_bytes:])
             return chunk
+
         chunk = bytes(self.buffer)
         self.buffer = bytearray()
         return chunk
