@@ -1,0 +1,12 @@
+__pycache__
+*.pyc
+*.pyo
+.git
+.gitignore
+.DS_Store
+.env
+.venv
+venv
+*.md
+tests/
+models/
