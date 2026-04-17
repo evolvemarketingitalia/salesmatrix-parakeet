@@ -46,7 +46,19 @@ API_TOKEN = os.environ.get("PARAKEET_API_TOKEN", "").strip()
 ALLOWED_ORIGINS = [
     o.strip() for o in os.environ.get(
         "PARAKEET_ALLOWED_ORIGINS",
-        "https://www.salesenhancer.it,https://salesenhancer.it,http://localhost:5173,http://localhost:5174,http://localhost:4173",
+        ",".join([
+            "https://www.salesenhancer.it",
+            "https://salesenhancer.it",
+            # Local dev servers (Vite defaults + project-specific 8080)
+            "http://localhost:3000",
+            "http://localhost:4173",
+            "http://localhost:5173",
+            "http://localhost:5174",
+            "http://localhost:5175",
+            "http://localhost:8080",
+            "http://127.0.0.1:5173",
+            "http://127.0.0.1:8080",
+        ]),
     ).split(",") if o.strip()
 ]
 MAX_SESSION_MINUTES = int(os.environ.get("PARAKEET_MAX_SESSION_MINUTES", "10"))
