@@ -1,7 +1,8 @@
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 websockets==13.1
-onnx-asr==0.7.0
+onnx-asr[cpu]==0.7.0
+onnxruntime==1.19.2
 huggingface-hub==0.26.2
 numpy>=1.26,<2
 soundfile==0.12.1
