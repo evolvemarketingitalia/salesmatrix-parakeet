@@ -27,6 +27,21 @@ SAMPLE_RATE = 16000
 MIN_CHUNK_MS = int(os.environ.get("PARAKEET_MIN_CHUNK_MS", "2000"))
 MAX_CHUNK_MS = int(os.environ.get("PARAKEET_MAX_CHUNK_MS", "6000"))
 SILENCE_RESET_MS = int(os.environ.get("PARAKEET_SILENCE_RESET_MS", "30000"))
+# Energy gate: skip inference if chunk RMS below this threshold (anti-hallucination)
+# 0.005 is about -46 dBFS, empirically safe for speech vs background noise
+SILENCE_RMS_THRESHOLD = float(os.environ.get("PARAKEET_SILENCE_RMS_THRESHOLD", "0.005"))
+
+# Common ASR hallucinations on silent/noisy chunks — filter these out entirely.
+# Matches when the WHOLE output is one of these (ignore leading/trailing punct).
+HALLUCINATION_STRINGS = {
+    s.lower() for s in [
+        "mm-hmm", "mm hmm", "mmhmm", "mm-mm", "mm mm", "mmmm",
+        "yeah", "yep", "uh", "um", "ah", "eh", "ehm", "hmm",
+        "ok", "okay", "so", "no", "no no", "no, no",
+        "bedade", "nova", "two", "yeah.", "yeah,",
+        ".", "...", "?", "!",
+    ]
+}
 
 
 @dataclass
@@ -79,6 +94,12 @@ class ParakeetTranscriber:
         """Transcribe raw PCM int16 little-endian audio bytes.
 
         Audio is expected at SAMPLE_RATE mono.
+
+        Silence/noise gating:
+        - If the chunk RMS is below SILENCE_RMS_THRESHOLD, we skip inference
+          entirely to avoid hallucinations ('Mm-hmm', 'Yeah', 'Bedade', ...)
+        - If the model returns a string that matches a known hallucination
+          (common filler words), we drop it.
         """
         if not self.is_ready():
             raise RuntimeError("Model not loaded")
@@ -87,17 +108,35 @@ class ParakeetTranscriber:
         samples = np.frombuffer(pcm16, dtype="<i2").astype(np.float32) / 32768.0
         duration_s = len(samples) / SAMPLE_RATE
 
+        # --- ENERGY GATE: skip silent/noise chunks entirely ---
+        rms = float(np.sqrt(np.mean(samples * samples))) if len(samples) > 0 else 0.0
+        if rms < SILENCE_RMS_THRESHOLD:
+            logger.info(
+                f"stream chunk: audio={duration_s:.2f}s, SKIPPED (rms={rms:.4f} < {SILENCE_RMS_THRESHOLD})"
+            )
+            return TranscriptionResult(text="", duration_s=duration_s)
+
         with self._lock:  # onnx-asr is not necessarily thread-safe
             start = time.time()
             text = self._model.recognize(samples)
             elapsed = time.time() - start
 
-        # INFO level for streaming chunks so we can spot latency regressions in prod
+        text = (text or "").strip()
+
+        # --- HALLUCINATION FILTER: drop known filler-only outputs ---
+        normalized = text.lower().rstrip(".,!?;:").strip()
+        if normalized in HALLUCINATION_STRINGS:
+            logger.info(
+                f"stream chunk: audio={duration_s:.2f}s, infer={elapsed:.3f}s, "
+                f"rms={rms:.4f}, HALLUCINATION_FILTERED: {text!r}"
+            )
+            return TranscriptionResult(text="", duration_s=duration_s)
+
         logger.info(
             f"stream chunk: audio={duration_s:.2f}s, infer={elapsed:.3f}s, "
-            f"rtf={elapsed/duration_s:.2f}x, text={text[:60]!r}"
+            f"rtf={elapsed/duration_s:.2f}x, rms={rms:.4f}, text={text[:60]!r}"
         )
-        return TranscriptionResult(text=(text or "").strip(), duration_s=duration_s)
+        return TranscriptionResult(text=text, duration_s=duration_s)
 
     def transcribe_file(self, file_bytes: bytes) -> TranscriptionResult:
         """Transcribe a full audio file (any format supported by soundfile/ffmpeg).
