@@ -63,6 +63,11 @@ ALLOWED_ORIGINS = [
 ]
 MAX_SESSION_MINUTES = int(os.environ.get("PARAKEET_MAX_SESSION_MINUTES", "10"))
 MAX_FRAME_BYTES = int(os.environ.get("PARAKEET_MAX_FRAME_BYTES", "8192"))  # 256ms max per frame
+# Rolling overlap between consecutive chunks to avoid cutting words mid-flow.
+# Too large => Parakeet re-transcribes the same segment differently on each pass
+# => duplicated / mutated words. Too small => words may be cut at boundaries.
+# 100ms is a good compromise for speech.
+OVERLAP_MS = int(os.environ.get("PARAKEET_OVERLAP_MS", "100"))
 
 transcriber = ParakeetTranscriber()
 
@@ -234,8 +239,8 @@ async def ws_transcribe(ws: WebSocket, token: Optional[str] = Query(None)):
     _total_sessions += 1
 
     session = StreamSession()
-    # Rolling overlap window: 500ms to avoid word cuts at chunk boundaries
-    session.overlap_bytes = int(0.5 * SAMPLE_RATE) * 2
+    # Rolling overlap window (tunable via PARAKEET_OVERLAP_MS env var)
+    session.overlap_bytes = (OVERLAP_MS * SAMPLE_RATE * 2) // 1000
 
     loop = asyncio.get_running_loop()
 
