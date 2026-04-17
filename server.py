@@ -221,6 +221,14 @@ async def ws_transcribe(ws: WebSocket, token: Optional[str] = Query(None)):
 
     await ws.accept()
 
+    async def safe_send_json(payload: dict) -> bool:
+        """Send JSON, swallow disconnect errors. Returns False if socket is dead."""
+        try:
+            await ws.send_json(payload)
+            return True
+        except Exception:
+            return False
+
     global _active_sessions, _total_sessions, _total_transcription_s
     _active_sessions += 1
     _total_sessions += 1
@@ -231,7 +239,7 @@ async def ws_transcribe(ws: WebSocket, token: Optional[str] = Query(None)):
 
     loop = asyncio.get_running_loop()
 
-    await ws.send_json({
+    await safe_send_json({
         "type": "ready",
         "sample_rate": SAMPLE_RATE,
         "min_chunk_ms": MIN_CHUNK_MS,
@@ -252,7 +260,7 @@ async def ws_transcribe(ws: WebSocket, token: Optional[str] = Query(None)):
                 pass
 
             if session.age_s > MAX_SESSION_MINUTES * 60:
-                await ws.send_json({"type": "info", "message": "session time limit reached"})
+                await safe_send_json({"type": "info", "message": "session time limit reached"})
                 await ws.close(code=1000, reason="time limit")
                 stop_flag.set()
                 return
@@ -267,13 +275,13 @@ async def ws_transcribe(ws: WebSocket, token: Optional[str] = Query(None)):
                     )
                 except Exception as e:
                     logger.exception("Chunk transcription failed")
-                    await ws.send_json({"type": "error", "code": "TRANSCRIBE_FAIL", "message": str(e)[:200]})
+                    await safe_send_json({"type": "error", "code": "TRANSCRIBE_FAIL", "message": str(e)[:200]})
                     continue
 
                 text = result.text
                 if text:
                     session.committed_text = (session.committed_text + " " + text).strip()
-                    await ws.send_json({
+                    await safe_send_json({
                         "type": "final",
                         "text": text,
                         "utterance_id": session.utterance_id,
@@ -286,7 +294,7 @@ async def ws_transcribe(ws: WebSocket, token: Optional[str] = Query(None)):
             if session.should_reset():
                 session.reset_count += 1
                 session.buffer = bytearray()
-                await ws.send_json({
+                await safe_send_json({
                     "type": "info",
                     "message": "reset after silence",
                     "reason": "anti_degrade",
@@ -306,7 +314,7 @@ async def ws_transcribe(ws: WebSocket, token: Optional[str] = Query(None)):
             if "bytes" in msg and msg["bytes"] is not None:
                 data = msg["bytes"]
                 if len(data) > MAX_FRAME_BYTES:
-                    await ws.send_json({
+                    await safe_send_json({
                         "type": "error",
                         "code": "FRAME_TOO_LARGE",
                         "message": f"frame {len(data)}B > max {MAX_FRAME_BYTES}B",
@@ -319,7 +327,7 @@ async def ws_transcribe(ws: WebSocket, token: Optional[str] = Query(None)):
                 try:
                     payload = json.loads(msg["text"])
                 except json.JSONDecodeError:
-                    await ws.send_json({"type": "error", "code": "INVALID_JSON"})
+                    await safe_send_json({"type": "error", "code": "INVALID_JSON"})
                     continue
 
                 mtype = payload.get("type")
@@ -333,7 +341,7 @@ async def ws_transcribe(ws: WebSocket, token: Optional[str] = Query(None)):
                             )
                             if result.text:
                                 session.committed_text = (session.committed_text + " " + result.text).strip()
-                                await ws.send_json({
+                                await safe_send_json({
                                     "type": "final",
                                     "text": result.text,
                                     "utterance_id": session.utterance_id,
@@ -342,15 +350,15 @@ async def ws_transcribe(ws: WebSocket, token: Optional[str] = Query(None)):
                                 _total_transcription_s += result.duration_s
                         except Exception as e:
                             logger.exception("Final flush failed")
-                    await ws.send_json({"type": "closed", "committed_text": session.committed_text})
+                    await safe_send_json({"type": "closed", "committed_text": session.committed_text})
                     break
                 elif mtype == "ping":
-                    await ws.send_json({"type": "pong"})
+                    await safe_send_json({"type": "pong"})
                 elif mtype == "config":
                     # Future: language hint, custom vocab — currently ignored
-                    await ws.send_json({"type": "config_ack"})
+                    await safe_send_json({"type": "config_ack"})
                 else:
-                    await ws.send_json({"type": "error", "code": "UNKNOWN_TYPE", "message": f"type={mtype}"})
+                    await safe_send_json({"type": "error", "code": "UNKNOWN_TYPE", "message": f"type={mtype}"})
 
     except WebSocketDisconnect:
         logger.info("WS client disconnected")
